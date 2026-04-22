@@ -34,8 +34,8 @@ class Coalescer:
         self._max_waiters = 0
 
     async def get_or_fetch(self, key: str, fetch_fn: Callable) -> Any:
+        existing_inflight = None
         is_owner = False
-        existing = None
 
         async with self._lock:
             existing = self._inflight.get(key)
@@ -44,19 +44,20 @@ class Coalescer:
                 self._coalesced_count += 1
                 if existing.waiters > self._max_waiters:
                     self._max_waiters = existing.waiters
+                existing_inflight = existing
             else:
-                existing = InFlight()
-                self._inflight[key] = existing
+                existing_inflight = InFlight()
+                self._inflight[key] = existing_inflight
                 self._fresh_count += 1
                 is_owner = True
 
         if is_owner:
-            return await self._do_fetch(key, existing, fetch_fn)
+            return await self._do_fetch(key, existing_inflight, fetch_fn)
 
-        await existing.event.wait()
-        if existing.exception is not None:
-            raise existing.exception
-        return existing.result
+        await existing_inflight.event.wait()
+        if existing_inflight.exception is not None:
+            raise existing_inflight.exception
+        return existing_inflight.result
 
     async def _do_fetch(self, key: str, inflight: InFlight, fetch_fn: Callable) -> Any:
         try:
@@ -67,10 +68,16 @@ class Coalescer:
             inflight.exception = e
             raise
         finally:
-            inflight.event.set()
+            # remove from dict FIRST, then notify waiters.
+            # if we set the event before the dict delete, a new request could
+            # see the in-flight entry, attach as waiter, wait forever because
+            # the event was already set and cleared by the previous wait. 
+            # (actually asyncio.Event.wait returns immediately if already set,
+            # but the waiter would then get stale result from a cleaned entry)
             async with self._lock:
                 if self._inflight.get(key) is inflight:
                     del self._inflight[key]
+            inflight.event.set()
 
     def stats(self) -> dict:
         total = self._coalesced_count + self._fresh_count
