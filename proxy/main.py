@@ -1,9 +1,10 @@
-"""bulkhead proxy with request coalescing and load shedding.
+"""bulkhead proxy with request coalescing, load shedding, and response cache.
 
 every GET /data/{key} goes through:
 1. shedder — capacity-based admission control (returns 503 if at limit)
 2. coalescer — dedups concurrent same-key requests on this replica
-3. backend fetch
+3. cache check (Redis) — short-TTL response cache shared across replicas
+4. backend fetch (only on cache miss)
 """
 
 import os
@@ -12,6 +13,7 @@ import time
 import httpx
 from fastapi import FastAPI, HTTPException
 
+from proxy.cache import ResponseCache
 from proxy.coalescer import Coalescer
 from proxy.shedder import Shedder
 
@@ -21,10 +23,12 @@ app = FastAPI(title="bulkhead")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:9000")
 BACKEND_TIMEOUT = float(os.getenv("BACKEND_TIMEOUT", "5.0"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "50"))
+CACHE_TTL_MS = int(os.getenv("CACHE_TTL_MS", "500"))
 
 _http_client: httpx.AsyncClient = None
 _coalescer = Coalescer()
 _shedder = Shedder(max_concurrent=MAX_CONCURRENT)
+_cache = ResponseCache(cache_ttl_ms=CACHE_TTL_MS)
 
 
 @app.on_event("startup")
@@ -34,12 +38,14 @@ async def startup():
         base_url=BACKEND_URL,
         timeout=BACKEND_TIMEOUT,
     )
+    await _cache.connect()
 
 
 @app.on_event("shutdown")
 async def shutdown():
     if _http_client:
         await _http_client.aclose()
+    await _cache.close()
 
 
 @app.get("/health")
@@ -52,6 +58,7 @@ async def stats():
     return {
         "coalescer": _coalescer.stats(),
         "shedder": _shedder.stats(),
+        "cache": _cache.stats(),
     }
 
 
@@ -59,10 +66,19 @@ async def stats():
 async def reset_stats():
     _coalescer.reset_stats()
     _shedder.reset_stats()
+    _cache.reset_stats()
     return {"reset": True}
 
 
-async def _fetch_from_backend(key: str) -> dict:
+async def _fetch_with_cache(key: str) -> dict:
+    """cache check, then backend on miss. populates cache on success."""
+    cached = await _cache.get(key)
+    if cached is not None:
+        # mark as cache hit so caller can see in payload
+        cached = dict(cached)
+        cached["_cache_hit"] = True
+        return cached
+
     try:
         resp = await _http_client.get(f"/data/{key}")
         resp.raise_for_status()
@@ -72,12 +88,15 @@ async def _fetch_from_backend(key: str) -> dict:
         raise HTTPException(status_code=e.response.status_code, detail=str(e))
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"backend error: {e}")
-    return resp.json()
+
+    result = resp.json()
+    # populate cache (fire-and-forget — failures already swallowed in cache.set)
+    await _cache.set(key, result)
+    return result
 
 
 @app.get("/data/{key}")
 async def proxy_get_data(key: str):
-    # admission control — fail fast if over capacity
     if not _shedder.try_acquire():
         raise HTTPException(
             status_code=503,
@@ -89,7 +108,7 @@ async def proxy_get_data(key: str):
     try:
         result = await _coalescer.get_or_fetch(
             key=key,
-            fetch_fn=lambda: _fetch_from_backend(key),
+            fetch_fn=lambda: _fetch_with_cache(key),
         )
         elapsed_ms = (time.perf_counter() - start) * 1000
         out = dict(result)

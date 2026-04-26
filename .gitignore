@@ -9,3 +9,4 @@ venv/
 *.log
 .pytest_cache/
 .locust_history/
+.DS_Store

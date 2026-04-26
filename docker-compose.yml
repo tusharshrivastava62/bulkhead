@@ -19,8 +19,12 @@ services:
     environment:
       - BACKEND_URL=http://backend:9000
       - REPLICA_ID=proxy1
+      - REDIS_URL=redis://redis:6379/0
+      - CACHE_TTL_MS=500
+      - MAX_CONCURRENT=50
     depends_on:
       - backend
+      - redis
 
   proxy2:
     build:
@@ -29,8 +33,12 @@ services:
     environment:
       - BACKEND_URL=http://backend:9000
       - REPLICA_ID=proxy2
+      - REDIS_URL=redis://redis:6379/0
+      - CACHE_TTL_MS=500
+      - MAX_CONCURRENT=50
     depends_on:
       - backend
+      - redis
 
   proxy3:
     build:
@@ -39,8 +47,12 @@ services:
     environment:
       - BACKEND_URL=http://backend:9000
       - REPLICA_ID=proxy3
+      - REDIS_URL=redis://redis:6379/0
+      - CACHE_TTL_MS=500
+      - MAX_CONCURRENT=50
     depends_on:
       - backend
+      - redis
 
   nginx:
     image: nginx:1.25-alpine
