@@ -1,21 +1,23 @@
 """bulkhead proxy with request coalescing, load shedding, and response cache.
 
 every GET /data/{key} goes through:
-1. shedder — capacity-based admission control (returns 503 if at limit)
-2. coalescer — dedups concurrent same-key requests on this replica
-3. cache check (Redis) — short-TTL response cache shared across replicas
-4. backend fetch (only on cache miss)
+1. priority — parse X-Priority header (1=critical, 2=normal, 3=batch)
+2. shedder — capacity-based admission control with tier awareness
+3. coalescer — dedups concurrent same-key requests on this replica
+4. cache check (Redis) — short-TTL response cache shared across replicas
+5. backend fetch (only on cache miss)
 """
 
 import os
 import time
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from proxy.cache import ResponseCache
 from proxy.coalescer import Coalescer
 from proxy.shedder import Shedder
+from proxy.priority import parse_priority, tier_name
 
 
 app = FastAPI(title="bulkhead")
@@ -74,7 +76,6 @@ async def _fetch_with_cache(key: str) -> dict:
     """cache check, then backend on miss. populates cache on success."""
     cached = await _cache.get(key)
     if cached is not None:
-        # mark as cache hit so caller can see in payload
         cached = dict(cached)
         cached["_cache_hit"] = True
         return cached
@@ -90,18 +91,19 @@ async def _fetch_with_cache(key: str) -> dict:
         raise HTTPException(status_code=502, detail=f"backend error: {e}")
 
     result = resp.json()
-    # populate cache (fire-and-forget — failures already swallowed in cache.set)
     await _cache.set(key, result)
     return result
 
 
 @app.get("/data/{key}")
-async def proxy_get_data(key: str):
-    if not _shedder.try_acquire():
+async def proxy_get_data(key: str, request: Request):
+    tier = parse_priority(request.headers.get("X-Priority"))
+
+    if not _shedder.try_acquire(tier=tier):
         raise HTTPException(
             status_code=503,
-            detail="shedding: at concurrency limit",
-            headers={"Retry-After": "1"},
+            detail=f"shedding: tier {tier} ({tier_name(tier)}) at capacity",
+            headers={"Retry-After": "1", "X-Tier": str(tier)},
         )
 
     start = time.perf_counter()
@@ -113,6 +115,7 @@ async def proxy_get_data(key: str):
         elapsed_ms = (time.perf_counter() - start) * 1000
         out = dict(result)
         out["_proxy_latency_ms"] = round(elapsed_ms, 2)
+        out["_tier"] = tier
         return out
     finally:
         elapsed_ms = (time.perf_counter() - start) * 1000
