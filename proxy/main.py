@@ -1,8 +1,9 @@
-"""bulkhead proxy with request coalescing, load shedding, and response cache.
+"""bulkhead proxy with priority-aware capacity + latency shedding,
+request coalescing, and Redis cache.
 
 every GET /data/{key} goes through:
 1. priority — parse X-Priority header (1=critical, 2=normal, 3=batch)
-2. shedder — capacity-based admission control with tier awareness
+2. shedder — capacity + latency-based admission (tier-1 always passes)
 3. coalescer — dedups concurrent same-key requests on this replica
 4. cache check (Redis) — short-TTL response cache shared across replicas
 5. backend fetch (only on cache miss)
@@ -119,7 +120,7 @@ async def proxy_get_data(key: str, request: Request):
         return out
     finally:
         elapsed_ms = (time.perf_counter() - start) * 1000
-        _shedder.release(elapsed_ms)
+        _shedder.release(elapsed_ms, tier=tier)
 
 
 if __name__ == "__main__":
