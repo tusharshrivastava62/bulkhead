@@ -1,7 +1,3 @@
-Good. File is open and ready.
-Now replace everything in that file with this complete README. Select all, delete, paste this in:
-markdown# bulkhead
-
 asyncio proxy with priority-tier admission control, load shedding, request 
 coalescing, and Redis cache. built to protect a backend service from 
 thundering herds and overload — without external coordination.
